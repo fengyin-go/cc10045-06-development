@@ -90,13 +90,16 @@ class BaseModuleService:
             return None, missing
 
         table = self._module_table()
+        columns = _table_columns(table)
         data: dict[str, Any] = {}
         for field in self.LIST_FIELDS:
             col = _to_column_name(field)
-            data[col] = values.get(field, "")
-        if "name" not in data and self.LIST_FIELDS:
+            if col in columns:
+                data[col] = values.get(field, "")
+        if "name" in columns and "name" not in data and self.LIST_FIELDS:
             data["name"] = values.get(self.LIST_FIELDS[0], "")
-        data["status"] = self.STATUS_ORDER[0]
+        if "status" in columns:
+            data["status"] = self.STATUS_ORDER[0]
 
         entry_id = db.insert(table, data)
         entry = db.fetchone(f"SELECT * FROM {table} WHERE id=?", [entry_id])
@@ -127,6 +130,12 @@ class BaseModuleService:
             "by_status": by_status,
             "abnormal": 0,
         }
+
+
+def _table_columns(table: str) -> set[str]:
+    """读取表的实际列名集合，登记时只写真实存在的列。"""
+    rows = db.fetchall(f"PRAGMA table_info({table})")
+    return {r["name"] for r in rows}
 
 
 def _to_column_name(chinese_field: str) -> str:

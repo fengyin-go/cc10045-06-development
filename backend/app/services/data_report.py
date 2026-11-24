@@ -2,6 +2,10 @@
 
 真实数据流：定义报告模板（包含指标集/周期/输出格式）→ pipeline.generate_report 读取最新指标值
 → 组装结构化报告内容 → 写入 report_outputs → 快照管理。
+
+签发数据流：pipeline.issue_report 在生成内容的同时读取实际采用的有效解释
+（已匹配到真实采样的复核行），冻结原文件行号和采样编号；未匹配行作为待核说明
+一并冻结，回查时可说明复核文件为什么有遗漏。已签发的输出不再变更。
 """
 from __future__ import annotations
 
@@ -9,7 +13,7 @@ import json
 from typing import Any
 
 from app.database import db
-from app.pipeline import generate_report
+from app.pipeline import generate_report, issue_report
 from app.services.base import BaseModuleService
 
 
@@ -31,6 +35,72 @@ class DataReportService(BaseModuleService):
 
         result = generate_report(dict(report))
         return {"ok": True, "report_name": result["report_name"], "summary": result["summary"]}
+
+    def issue(self, report_id: int) -> dict[str, Any]:
+        """签发一份数据报告：冻结本次实际采用的有效解释与文件遗漏。"""
+        report = db.fetchone("SELECT * FROM reports WHERE id=?", [report_id])
+        if report is None:
+            return {"ok": False, "message": f"报告 {report_id} 不存在"}
+
+        result = issue_report(dict(report))
+        return {
+            "ok": True,
+            "output_id": result["id"],
+            "report_name": result["report_name"],
+            "adopted_count": result["adopted_count"],
+            "omission_count": result["omission_count"],
+            "summary": result["summary"],
+        }
+
+    def review_output(self, output_id: int) -> dict[str, Any]:
+        """回查周报：采用的指标数据与正式解释，以及文件遗漏原因。
+
+        数据来自签发时冻结的 report_explanations / report_omissions，
+        后续补采和重传不会改变已签发输出的内容。
+        """
+        output = db.fetchone("SELECT * FROM report_outputs WHERE id=?", [output_id])
+        if output is None:
+            return {"ok": False, "message": f"报告输出 {output_id} 不存在"}
+        report = db.fetchone("SELECT * FROM reports WHERE id=?", [output["report_id"]])
+
+        adopted = db.fetchall(
+            "SELECT * FROM report_explanations WHERE report_output_id=? ORDER BY id",
+            [output_id],
+        )
+        for entry in adopted:
+            sampling = db.fetchone(
+                "SELECT * FROM metric_values WHERE id=?", [entry["sampling_id"]])
+            metric = db.fetchone(
+                "SELECT * FROM metrics WHERE metric_name=?", [entry["metric_name"]])
+            entry["sampling"] = {
+                "snapshot_value": sampling["snapshot_value"] if sampling else None,
+                "snapshot_time": sampling["snapshot_time"] if sampling else None,
+                "comparison_status": sampling["comparison_status"] if sampling else None,
+                "z_score": sampling["z_score"] if sampling else None,
+            }
+            entry["metric_unit"] = metric["unit"] if metric else ""
+            entry["disposition"] = "已批准归因"
+
+        omissions = db.fetchall(
+            "SELECT * FROM report_omissions WHERE report_output_id=? ORDER BY id",
+            [output_id],
+        )
+        for entry in omissions:
+            entry["disposition"] = "待核说明"
+
+        return {
+            "ok": True,
+            "output_id": output_id,
+            "report_id": output["report_id"],
+            "report_name": report["report_name"] if report else "",
+            "generated_at": output["generated_at"],
+            "adopted": adopted,
+            "omissions": omissions,
+            "summary": {
+                "adopted_count": len(adopted),
+                "omission_count": len(omissions),
+            },
+        }
 
     def recent_outputs(self, report_id: int, limit: int = 10) -> list[dict[str, Any]]:
         """获取报告的历史生成结果。"""

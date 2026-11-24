@@ -79,5 +79,23 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 异常解释复核与报告签发
+
+异常归因除系统计算结果外，支持从复核文件导入人工解释，并在数据报告签发时采纳：
+
+| 接口 | 说明 |
+| --- | --- |
+| `POST /api/pipeline/review-files/import` | 导入复核文件（JSON 行或 `csv_text`），逐行按指标和业务时点关联指标采样，保存有效解释和未匹配原因 |
+| `GET /api/pipeline/review-files` / `GET /api/pipeline/review-files/{file_id}` | 复核文件批次列表 / 逐行回查（含未匹配原因） |
+| `POST /api/pipeline/metrics/sample` | 补采：为指标在指定业务时点登记采样，返回采样编号 |
+| `POST /api/pipeline/report/{report_id}/issue` | 签发报告：冻结本次实际采用的有效解释（原文件行号+采样编号）和文件遗漏 |
+| `GET /api/pipeline/report-outputs/{output_id}/review` | 回查周报：采用的指标数据与已批准归因，以及该文件为什么有遗漏 |
+
+规则：
+
+- 只有真实匹配到指标采样的时点才能出正式解释（`已批准归因`）；未匹配行只作为`待核说明`冻结。
+- 同一行（指标+业务时点+解释）按内容哈希全局去重，重传不重复计入；补采后重传会把原未匹配行提升为已匹配，不新增记录。
+- 签发即冻结：`report_explanations` / `report_omissions` 只插入不修改，断续补做不影响已签发报告的采用范围，新签发的报告对每条解释各计一次。
+
 领域：数据工程
 子方向：数据分析与数据应用

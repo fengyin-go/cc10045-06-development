@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import random
@@ -666,6 +667,228 @@ def detect_anomaly(analysis: dict[str, Any]) -> dict[str, Any]:
 
 
 # ============================================================================
+# 复核文件导入管道：异常解释逐行关联指标采样
+# ============================================================================
+
+def _normalize_business_time(raw: str) -> str | None:
+    """把业务时点规范化为可前缀匹配的形式（分钟级或日期级）。
+
+    支持 2026-11-16T08:00[:00]、2026-11-16 08:00[:00]、2026-11-16。
+    无法识别时返回 None。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%dT%H:%M")
+        except ValueError:
+            continue
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _find_metric_by_name(metric_name: str) -> dict[str, Any] | None:
+    """按名称定位指标：先精确匹配，再模糊匹配（与既有管道口径一致）。"""
+    exact = db.fetchone("SELECT * FROM metrics WHERE metric_name = ?", [metric_name])
+    if exact:
+        return exact
+    return db.fetchone(
+        "SELECT * FROM metrics WHERE metric_name LIKE ? ORDER BY id LIMIT 1",
+        [f"%{metric_name}%"],
+    )
+
+
+def _match_sampling(metric_id: int, business_time: str) -> tuple[dict[str, Any] | None, str | None]:
+    """按指标和业务时点查找真实采样，返回 (采样记录, 未匹配原因)。"""
+    normalized = _normalize_business_time(business_time)
+    if normalized is None:
+        return None, "业务时点格式无法识别"
+    sampling = db.fetchone(
+        "SELECT * FROM metric_values WHERE metric_id=? AND snapshot_time LIKE ? "
+        "ORDER BY snapshot_time DESC LIMIT 1",
+        [metric_id, f"{normalized}%"],
+    )
+    if sampling is None:
+        return None, "该业务时点无指标采样"
+    return sampling, None
+
+
+def _explanation_hash(metric_name: str, business_time: str, explanation: str) -> str:
+    """行内容哈希：同一行（指标+业务时点+解释）重传时据此去重。"""
+    base = "|".join([metric_name.strip(), business_time.strip(), explanation.strip()])
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+
+def _resolve_explanation_match(metric_name: str, business_time: str) -> tuple[int | None, int | None, str | None]:
+    """尝试把一行解释关联到指标采样，返回 (metric_id, sampling_id, 未匹配原因)。"""
+    metric = _find_metric_by_name(metric_name)
+    if metric is None:
+        return None, None, "指标未登记"
+    sampling, reason = _match_sampling(metric["id"], business_time)
+    if sampling is None:
+        return metric["id"], None, reason
+    return metric["id"], sampling["id"], None
+
+
+def import_review_file(file_name: str, rows: list[dict[str, Any]], uploader: str = "") -> dict[str, Any]:
+    """导入复核文件：逐行按指标和业务时点关联采样，保存有效解释与未匹配原因。
+
+    去重与补采规则：
+    - 同一行（指标+业务时点+解释）全局只计一次，重传不重复计入；
+    - 已匹配的行重传时标记为重复行；
+    - 此前未匹配的行在补采后重传时重新匹配，提升为已匹配（更新原记录，不新增）。
+    """
+    file_id = db.insert("review_files", {
+        "file_name": file_name,
+        "uploader": uploader,
+        "total_rows": len(rows),
+    })
+
+    matched = unmatched = duplicate = 0
+    row_results: list[dict[str, Any]] = []
+
+    for idx, raw in enumerate(rows, start=1):
+        row_no = int(raw.get("row_no") or idx)
+        metric_name = str(raw.get("metric_name") or raw.get("指标") or "").strip()
+        business_time = str(raw.get("business_time") or raw.get("业务时点") or "").strip()
+        explanation = str(raw.get("explanation") or raw.get("解释") or "").strip()
+
+        row_hash = _explanation_hash(metric_name, business_time, explanation)
+        existing = db.fetchone(
+            "SELECT * FROM review_explanations WHERE row_hash=?", [row_hash])
+
+        if existing and existing["match_status"] == "已匹配":
+            # 同一行重传：不重复计入
+            row_result, reason = "重复行", None
+            explanation_id = existing["id"]
+            sampling_id = existing["sampling_id"]
+            duplicate += 1
+        else:
+            if not metric_name or not business_time or not explanation:
+                metric_id, sampling_id, reason = None, None, "缺少必要字段（指标/业务时点/解释）"
+            else:
+                metric_id, sampling_id, reason = _resolve_explanation_match(
+                    metric_name, business_time)
+
+            if existing:
+                # 补采后重传：在原记录上更新匹配结果，不新增行
+                if sampling_id is not None:
+                    db.update("review_explanations", {
+                        "match_status": "已匹配",
+                        "metric_id": metric_id,
+                        "sampling_id": sampling_id,
+                        "unmatched_reason": None,
+                        "updated_at": db.now(),
+                    }, "id=?", [existing["id"]])
+                    row_result = "补采匹配"
+                    matched += 1
+                else:
+                    db.update("review_explanations", {
+                        "unmatched_reason": reason,
+                        "updated_at": db.now(),
+                    }, "id=?", [existing["id"]])
+                    row_result = "未匹配"
+                    unmatched += 1
+                explanation_id = existing["id"]
+            else:
+                explanation_id = db.insert("review_explanations", {
+                    "file_id": file_id,
+                    "row_no": row_no,
+                    "metric_name": metric_name,
+                    "metric_id": metric_id,
+                    "business_time": business_time,
+                    "explanation": explanation,
+                    "match_status": "已匹配" if sampling_id is not None else "未匹配",
+                    "unmatched_reason": reason,
+                    "sampling_id": sampling_id,
+                    "row_hash": row_hash,
+                })
+                if sampling_id is not None:
+                    row_result = "已匹配"
+                    matched += 1
+                else:
+                    row_result = "未匹配"
+                    unmatched += 1
+
+        db.insert("review_file_rows", {
+            "file_id": file_id,
+            "row_no": row_no,
+            "explanation_id": explanation_id,
+            "row_result": row_result,
+            "unmatched_reason": reason,
+        })
+        row_results.append({
+            "row_no": row_no,
+            "metric_name": metric_name,
+            "business_time": business_time,
+            "explanation_id": explanation_id,
+            "row_result": row_result,
+            "sampling_id": sampling_id if row_result != "未匹配" else None,
+            "unmatched_reason": reason,
+        })
+
+    db.update("review_files", {
+        "matched_rows": matched,
+        "unmatched_rows": unmatched,
+        "duplicate_rows": duplicate,
+    }, "id=?", [file_id])
+
+    return {
+        "ok": True,
+        "file_id": file_id,
+        "file_name": file_name,
+        "total_rows": len(rows),
+        "matched_rows": matched,
+        "unmatched_rows": unmatched,
+        "duplicate_rows": duplicate,
+        "rows": row_results,
+    }
+
+
+def register_metric_sampling(metric_name: str = "", metric_id: int | None = None,
+                             snapshot_value: float = 0.0,
+                             snapshot_time: str = "") -> dict[str, Any]:
+    """补采：为指定指标在指定业务时点登记一条采样，返回采样编号。"""
+    metric: dict[str, Any] | None = None
+    if metric_id is not None:
+        metric = db.fetchone("SELECT * FROM metrics WHERE id=?", [metric_id])
+    elif metric_name:
+        metric = _find_metric_by_name(metric_name)
+    if metric is None:
+        return {"ok": False, "message": "指标未登记，无法补采"}
+
+    normalized = _normalize_business_time(snapshot_time)
+    if normalized is None or len(normalized) < 16:
+        return {"ok": False, "message": "采样时间格式无法识别（需精确到分钟）"}
+    canonical_time = f"{normalized}:00" if len(normalized) == 16 else normalized
+
+    baseline = db.fetchone(
+        "SELECT snapshot_value FROM metric_values WHERE metric_id=? "
+        "ORDER BY snapshot_time DESC LIMIT 1",
+        [metric["id"]],
+    )
+    sampling_id = db.insert("metric_values", {
+        "metric_id": metric["id"],
+        "snapshot_value": round(float(snapshot_value), 4),
+        "snapshot_time": canonical_time,
+        "calibration_version": metric.get("calibration_version", 1),
+        "baseline_value": baseline["snapshot_value"] if baseline else None,
+        "comparison_status": "已保存",
+    })
+    return {
+        "ok": True,
+        "sampling_id": sampling_id,
+        "metric_id": metric["id"],
+        "metric_name": metric["metric_name"],
+        "snapshot_time": canonical_time,
+    }
+
+
+# ============================================================================
 # 预测管道
 # ============================================================================
 
@@ -851,23 +1074,27 @@ def _extract_dim_values(members: list[dict[str, Any]], dim: str) -> list[float]:
 # 报告生成管道
 # ============================================================================
 
-def generate_report(report: dict[str, Any]) -> dict[str, Any]:
-    """按报告模板生成数据报告。
-
-    读取关联指标的最新值，组装成结构化报告内容，写入 report_outputs 表。
-    支持 JSON 和 CSV 格式输出。
-    """
-    report_id = report["id"]
+def _report_metric_scope(report: dict[str, Any]) -> list[int]:
+    """解析报告包含指标集为指标 ID 列表。"""
     metric_ids_raw = report.get("包含指标集", report.get("metric_ids", "[]"))
-    output_format = report.get("输出格式", report.get("output_format", "json"))
-
     try:
         metric_ids = json.loads(metric_ids_raw) if isinstance(metric_ids_raw, str) else metric_ids_raw
     except (json.JSONDecodeError, TypeError):
         metric_ids = []
+    scope: list[int] = []
+    for mid in metric_ids or []:
+        try:
+            scope.append(int(mid))
+        except (TypeError, ValueError):
+            continue
+    return scope
+
+
+def _collect_report_sections(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """读取报告关联指标的最新值，组装结构化小节。"""
+    metric_ids = _report_metric_scope(report)
 
     sections: list[dict[str, Any]] = []
-
     if metric_ids:
         for mid in metric_ids:
             m = db.fetchone("SELECT * FROM metrics WHERE id=?", [mid])
@@ -902,6 +1129,18 @@ def generate_report(report: dict[str, Any]) -> dict[str, Any]:
                 "current_value": latest["snapshot_value"] if latest else 0,
                 "status": latest["comparison_status"] if latest else "已保存",
             })
+    return sections
+
+
+def generate_report(report: dict[str, Any]) -> dict[str, Any]:
+    """按报告模板生成数据报告。
+
+    读取关联指标的最新值，组装成结构化报告内容，写入 report_outputs 表。
+    支持 JSON 和 CSV 格式输出。
+    """
+    report_id = report["id"]
+    output_format = report.get("输出格式", report.get("output_format", "json"))
+    sections = _collect_report_sections(report)
 
     report_content = {
         "report_name": report.get("报告名称", report.get("report_name", "")),
@@ -925,6 +1164,116 @@ def generate_report(report: dict[str, Any]) -> dict[str, Any]:
         "id": output_id,
         "report_name": report_content["report_name"],
         "format": output_format,
+        "summary": report_content["summary"],
+    }
+
+
+def issue_report(report: dict[str, Any]) -> dict[str, Any]:
+    """签发数据报告：冻结本次实际采用的有效解释与复核文件遗漏。
+
+    规则：
+    - 只有真实匹配到指标采样的解释才能作为正式解释（已批准归因）进入正文；
+    - 采用记录保存原文件行号和采样编号，写入 report_explanations 后不再变更；
+    - 同一报告内同一解释只计一次（report_output_id + explanation_id 唯一）；
+    - 仍未匹配的行作为待核说明冻结进 report_omissions，供回查说明文件遗漏；
+    - 断续补做只影响之后签发的报告，已签发输出的采用范围保持不变。
+    """
+    report_id = report["id"]
+    sections = _collect_report_sections(report)
+    scope = _report_metric_scope(report)
+
+    def _in_scope(metric_id: int | None) -> bool:
+        if not scope:
+            return True
+        return metric_id in scope if metric_id is not None else False
+
+    valid_rows = db.fetchall(
+        "SELECT * FROM review_explanations WHERE match_status='已匹配' ORDER BY id")
+    adopted = [e for e in valid_rows if _in_scope(e["metric_id"])]
+
+    pending_rows = db.fetchall(
+        "SELECT * FROM review_explanations WHERE match_status='未匹配' ORDER BY id")
+    omissions = [e for e in pending_rows if _in_scope(e["metric_id"])]
+
+    adopted_entries: list[dict[str, Any]] = []
+    for e in adopted:
+        sampling = db.fetchone(
+            "SELECT * FROM metric_values WHERE id=?", [e["sampling_id"]])
+        adopted_entries.append({
+            "explanation_id": e["id"],
+            "file_id": e["file_id"],
+            "row_no": e["row_no"],
+            "sampling_id": e["sampling_id"],
+            "metric_name": e["metric_name"],
+            "business_time": e["business_time"],
+            "explanation": e["explanation"],
+            "disposition": "已批准归因",
+            "sampling": {
+                "snapshot_value": sampling["snapshot_value"] if sampling else None,
+                "snapshot_time": sampling["snapshot_time"] if sampling else None,
+                "comparison_status": sampling["comparison_status"] if sampling else None,
+            },
+        })
+
+    pending_entries = [{
+        "explanation_id": e["id"],
+        "file_id": e["file_id"],
+        "row_no": e["row_no"],
+        "metric_name": e["metric_name"],
+        "business_time": e["business_time"],
+        "explanation": e["explanation"],
+        "disposition": "待核说明",
+        "reason": e["unmatched_reason"] or "未匹配",
+    } for e in omissions]
+
+    report_content = {
+        "report_name": report.get("报告名称", report.get("report_name", "")),
+        "generated_at": db.now(),
+        "issued": True,
+        "sections": sections,
+        "adopted_explanations": adopted_entries,
+        "pending_explanations": pending_entries,
+        "summary": {
+            "total_metrics": len(sections),
+            "abnormal_count": sum(1 for s in sections if s.get("status") == "有异常"),
+            "normal_count": sum(1 for s in sections if s.get("status") == "已保存"),
+            "adopted_explanations": len(adopted_entries),
+            "pending_explanations": len(pending_entries),
+        },
+    }
+
+    output_id = db.insert("report_outputs", {
+        "report_id": report_id,
+        "output_content": json.dumps(report_content, ensure_ascii=False, indent=2),
+    })
+
+    # 冻结采用范围：原文件行号 + 采样编号
+    for e in adopted:
+        db.execute(
+            "INSERT OR IGNORE INTO report_explanations "
+            "(report_output_id, explanation_id, file_id, row_no, sampling_id, "
+            "metric_name, business_time, explanation) VALUES (?,?,?,?,?,?,?,?)",
+            [output_id, e["id"], e["file_id"], e["row_no"], e["sampling_id"],
+             e["metric_name"], e["business_time"], e["explanation"]],
+        )
+
+    # 冻结遗漏原因：回查时能说明该文件为什么有遗漏
+    for e in omissions:
+        db.insert("report_omissions", {
+            "report_output_id": output_id,
+            "file_id": e["file_id"],
+            "row_no": e["row_no"],
+            "metric_name": e["metric_name"],
+            "business_time": e["business_time"],
+            "reason": e["unmatched_reason"] or "未匹配",
+        })
+
+    return {
+        "id": output_id,
+        "report_name": report_content["report_name"],
+        "issued": True,
+        "adopted_count": len(adopted_entries),
+        "omission_count": len(pending_entries),
         "summary": report_content["summary"],
     }
 

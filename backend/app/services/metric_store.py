@@ -10,7 +10,7 @@ import json
 from typing import Any
 
 from app.database import db
-from app.pipeline import compute_metric_snapshot
+from app.pipeline import compute_metric_snapshot, register_metric_sampling
 from app.services.base import BaseModuleService
 
 
@@ -42,6 +42,17 @@ class MetricStoreService(BaseModuleService):
         if result is None:
             return {"ok": False, "message": f"指标 {metric['metric_name']} 计算失败"}
         return {"ok": True, "result": result}
+
+    def register_sampling(self, metric_name: str = "", metric_id: int | None = None,
+                          snapshot_value: float = 0.0,
+                          snapshot_time: str = "") -> dict[str, Any]:
+        """补采：为指标在指定业务时点登记一条采样，供复核解释关联。"""
+        if not str(snapshot_time or "").strip():
+            return {"ok": False, "message": "采样时间不能为空"}
+        return register_metric_sampling(
+            metric_name=metric_name, metric_id=metric_id,
+            snapshot_value=snapshot_value, snapshot_time=snapshot_time,
+        )
 
     def compute_all(self) -> dict[str, Any]:
         """对所有指标执行快照计算。"""

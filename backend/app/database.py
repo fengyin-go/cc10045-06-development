@@ -256,6 +256,86 @@ DDL_STATEMENTS = [
         FOREIGN KEY (report_id) REFERENCES reports(id)
     )""",
 
+    # ==================== Review & Explanation Tier ====================
+    # 复核文件：每次上传一个批次，记录逐行匹配的汇总计数
+    """CREATE TABLE IF NOT EXISTS review_files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_name TEXT NOT NULL,
+        uploader TEXT NOT NULL DEFAULT '',
+        total_rows INTEGER NOT NULL DEFAULT 0,
+        matched_rows INTEGER NOT NULL DEFAULT 0,
+        unmatched_rows INTEGER NOT NULL DEFAULT 0,
+        duplicate_rows INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )""",
+
+    # 异常解释：按行内容全局去重（同一行重传不重复计入），
+    # file_id/row_no 指向首次出现的原文件与原文件行号
+    """CREATE TABLE IF NOT EXISTS review_explanations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id INTEGER NOT NULL,
+        row_no INTEGER NOT NULL,
+        metric_name TEXT NOT NULL,
+        metric_id INTEGER,
+        business_time TEXT NOT NULL,
+        explanation TEXT NOT NULL,
+        match_status TEXT NOT NULL DEFAULT '未匹配',
+        unmatched_reason TEXT,
+        sampling_id INTEGER,
+        row_hash TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT,
+        FOREIGN KEY (file_id) REFERENCES review_files(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_re_file ON review_explanations(file_id)",
+    "CREATE INDEX IF NOT EXISTS idx_re_status ON review_explanations(match_status)",
+
+    # 每次上传的逐行结果：已匹配 / 未匹配 / 重复行 / 补采匹配
+    """CREATE TABLE IF NOT EXISTS review_file_rows (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id INTEGER NOT NULL,
+        row_no INTEGER NOT NULL,
+        explanation_id INTEGER NOT NULL,
+        row_result TEXT NOT NULL,
+        unmatched_reason TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (file_id) REFERENCES review_files(id),
+        FOREIGN KEY (explanation_id) REFERENCES review_explanations(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_rfr_file ON review_file_rows(file_id)",
+
+    # 报告签发时实际采用的解释：冻结原文件行号和采样编号，签发后不再变更
+    """CREATE TABLE IF NOT EXISTS report_explanations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        report_output_id INTEGER NOT NULL,
+        explanation_id INTEGER NOT NULL,
+        file_id INTEGER NOT NULL,
+        row_no INTEGER NOT NULL,
+        sampling_id INTEGER NOT NULL,
+        metric_name TEXT NOT NULL,
+        business_time TEXT NOT NULL,
+        explanation TEXT NOT NULL,
+        adopted_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(report_output_id, explanation_id),
+        FOREIGN KEY (report_output_id) REFERENCES report_outputs(id),
+        FOREIGN KEY (explanation_id) REFERENCES review_explanations(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_re_output ON report_explanations(report_output_id)",
+
+    # 报告签发时仍未匹配的遗漏行：冻结原因，供回查说明文件遗漏
+    """CREATE TABLE IF NOT EXISTS report_omissions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        report_output_id INTEGER NOT NULL,
+        file_id INTEGER NOT NULL,
+        row_no INTEGER NOT NULL,
+        metric_name TEXT NOT NULL,
+        business_time TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (report_output_id) REFERENCES report_outputs(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_ro_output ON report_omissions(report_output_id)",
+
     # ==================== Operational Tier ====================
     """CREATE TABLE IF NOT EXISTS alerts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

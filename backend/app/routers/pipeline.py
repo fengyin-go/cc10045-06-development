@@ -1,6 +1,9 @@
 """数据分析管道路由：事件采集、聚合执行、指标快照、分群计算等核心操作入口。"""
 from __future__ import annotations
 
+import csv
+import io
+
 from fastapi import APIRouter
 
 from app.database import db
@@ -10,6 +13,7 @@ from app.pipeline import (
     compute_retention, compute_segment, generate_report,
     ingest_events, precompute_cube, seed_real_data,
 )
+from app.schemas import MetricSamplingPayload, ReviewFileImportPayload
 from app.services import service_for
 
 router = APIRouter(prefix="/api/pipeline", tags=["分析管线"])
@@ -106,6 +110,70 @@ def api_generate_report(report_id: int) -> dict:
     """对指定报告模板执行生成。"""
     svc = service_for("data_report")
     return svc.generate(report_id)
+
+
+@router.post("/report/{report_id}/issue")
+def api_issue_report(report_id: int) -> dict:
+    """签发报告：冻结本次实际采用的有效解释（原文件行号+采样编号）和文件遗漏。"""
+    svc = service_for("data_report")
+    return svc.issue(report_id)
+
+
+@router.get("/report-outputs/{output_id}/review")
+def api_review_report_output(output_id: int) -> dict:
+    """回查周报：采用的指标数据与正式解释，以及该文件为什么有遗漏。"""
+    svc = service_for("data_report")
+    return svc.review_output(output_id)
+
+
+def _parse_review_csv(csv_text: str) -> list[dict]:
+    """解析复核文件 CSV 文本，表头支持 指标/业务时点/解释/行号 或英文字段名。"""
+    reader = csv.DictReader(io.StringIO(csv_text))
+    rows: list[dict] = []
+    for raw in reader:
+        rows.append({
+            "row_no": raw.get("行号") or raw.get("row_no") or None,
+            "metric_name": (raw.get("指标") or raw.get("metric_name") or "").strip(),
+            "business_time": (raw.get("业务时点") or raw.get("business_time") or "").strip(),
+            "explanation": (raw.get("解释") or raw.get("explanation") or "").strip(),
+        })
+    return rows
+
+
+@router.post("/review-files/import")
+def api_import_review_file(payload: ReviewFileImportPayload) -> dict:
+    """导入复核文件：逐行按指标和业务时点关联采样，保存有效解释和未匹配原因。"""
+    rows: list[dict] = [r.model_dump() for r in payload.rows]
+    if payload.csv_text and payload.csv_text.strip():
+        rows.extend(_parse_review_csv(payload.csv_text))
+    svc = service_for("anomaly_analysis")
+    return svc.import_review(payload.file_name, rows, payload.uploader)
+
+
+@router.get("/review-files")
+def api_list_review_files() -> dict:
+    """列出全部已导入的复核文件批次。"""
+    svc = service_for("anomaly_analysis")
+    return {"ok": True, "items": svc.list_review_files()}
+
+
+@router.get("/review-files/{file_id}")
+def api_review_file_detail(file_id: int) -> dict:
+    """回查复核文件：逐行导入结果与未匹配原因。"""
+    svc = service_for("anomaly_analysis")
+    return svc.review_file_detail(file_id)
+
+
+@router.post("/metrics/sample")
+def api_register_metric_sampling(payload: MetricSamplingPayload) -> dict:
+    """补采：为指标在指定业务时点登记一条采样，返回采样编号。"""
+    svc = service_for("metric_store")
+    return svc.register_sampling(
+        metric_name=payload.metric_name or "",
+        metric_id=payload.metric_id,
+        snapshot_value=payload.snapshot_value,
+        snapshot_time=payload.snapshot_time,
+    )
 
 
 @router.post("/alerts/check-all")
